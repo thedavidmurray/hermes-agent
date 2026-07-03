@@ -792,6 +792,43 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- routine (recurring tasks) ---
+    p_routine = sub.add_parser(
+        "routine",
+        help="Manage recurring tasks (routines) that materialize ordinary tasks on schedule",
+    )
+    routine_sub = p_routine.add_subparsers(dest="routine_action")
+
+    r_create = routine_sub.add_parser("create", help="Create a new routine")
+    r_create.add_argument("title", help="Routine title (also used for materialized tasks)")
+    r_create.add_argument("--cron", required=True, help="Cron expression, e.g. '0 9 * * 1'")
+    r_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    r_create.add_argument("--body", default=None, help="Opening post for materialized tasks")
+    r_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    r_create.add_argument("--skill", action="append", default=[], dest="skills",
+                          help="Skill to force-load into workers (repeatable)")
+    r_create.add_argument("--concurrency", default="skip_if_active",
+                          choices=sorted(kb.VALID_ROUTINE_CONCURRENCY),
+                          help="Policy when a prior instance is still active")
+    r_create.add_argument("--catch-up", default="skip_missed", dest="catch_up",
+                          choices=sorted(kb.VALID_ROUTINE_CATCH_UP),
+                          help="Policy after missed windows (default: skip_missed)")
+    r_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    r_list = routine_sub.add_parser("list", aliases=["ls"], help="List routines")
+    r_list.add_argument("--status", default=None, choices=sorted(kb.VALID_ROUTINE_STATUSES))
+    r_list.add_argument("--json", action="store_true")
+
+    r_pause = routine_sub.add_parser("pause", help="Pause a routine")
+    r_pause.add_argument("routine_id")
+    r_resume = routine_sub.add_parser("resume", help="Resume a routine")
+    r_resume.add_argument("routine_id")
+    r_run = routine_sub.add_parser("run-now", help="Materialize a task from a routine now")
+    r_run.add_argument("routine_id")
+    r_run.add_argument("--json", action="store_true")
+    r_delete = routine_sub.add_parser("delete", help="Delete a routine")
+    r_delete.add_argument("routine_id")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -916,6 +953,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
         "gc":       _cmd_gc,
+        "routine":  _cmd_routine,
     }
     handler = handlers.get(action)
     if not handler:
@@ -2575,6 +2613,129 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Slash-command entry point (used by /kanban from CLI and gateway)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Routines (recurring tasks)
+# ---------------------------------------------------------------------------
+
+def _cmd_routine(args: argparse.Namespace) -> int:
+    sub = getattr(args, "routine_action", None) or "list"
+    if sub in {"list", "ls"}:
+        return _cmd_routine_list(args)
+    if sub == "create":
+        return _cmd_routine_create(args)
+    if sub == "pause":
+        return _cmd_routine_pause(args)
+    if sub == "resume":
+        return _cmd_routine_resume(args)
+    if sub == "run-now":
+        return _cmd_routine_run_now(args)
+    if sub == "delete":
+        return _cmd_routine_delete(args)
+    print(f"kanban routine: unknown action {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_routine_create(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        routine_id = kb.create_routine(
+            conn,
+            title=args.title,
+            cron_expr=args.cron,
+            assignee=args.assignee,
+            body=args.body,
+            priority=args.priority,
+            skills=args.skills,
+            concurrency=args.concurrency,
+            catch_up=args.catch_up,
+            board_id=kb.get_current_board() or "default",
+        )
+    if getattr(args, "json", False):
+        print(json.dumps({"id": routine_id}, indent=2))
+    else:
+        print(f"Routine {routine_id} created.")
+    return 0
+
+
+def _cmd_routine_list(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        routines = kb.list_routines(
+            conn,
+            board_id=kb.get_current_board() or "default",
+            status=getattr(args, "status", None),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(routines, indent=2, default=str))
+        return 0
+    if not routines:
+        print("(no routines on this board)")
+        return 0
+    print(f"{'ID':16s}  {'STATUS':8s}  {'CRON':16s}  {'ASSIGNEE':16s}  TITLE")
+    for r in routines:
+        print(
+            f"{r['id']:16s}  {r['status']:8s}  {r['cron_expr']:16s}  "
+            f"{(r['assignee'] or '(unassigned)'):16s}  {r['title']}"
+        )
+    return 0
+
+
+def _cmd_routine_pause(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        ok = kb.update_routine_status(conn, args.routine_id, "paused")
+    if not ok:
+        print(f"kanban routine pause: {args.routine_id} not found", file=sys.stderr)
+        return 1
+    print(f"Routine {args.routine_id} paused.")
+    return 0
+
+
+def _cmd_routine_resume(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        ok = kb.update_routine_status(conn, args.routine_id, "active")
+    if not ok:
+        print(f"kanban routine resume: {args.routine_id} not found", file=sys.stderr)
+        return 1
+    print(f"Routine {args.routine_id} resumed.")
+    return 0
+
+
+def _cmd_routine_run_now(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        routine = kb.get_routine(conn, args.routine_id)
+        if routine is None:
+            print(f"kanban routine run-now: {args.routine_id} not found", file=sys.stderr)
+            return 1
+        if routine["status"] != "active":
+            print(
+                f"kanban routine run-now: {args.routine_id} is {routine['status']}",
+                file=sys.stderr,
+            )
+            return 1
+        now = int(time.time())
+        task_id = kb._materialize_routine(conn, routine, now)
+    if task_id is None:
+        print(
+            f"kanban routine run-now: {args.routine_id} skipped (concurrency policy)",
+            file=sys.stderr,
+        )
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps({"routine_id": args.routine_id, "task_id": task_id}, indent=2))
+    else:
+        print(f"Materialized task {task_id} from routine {args.routine_id}.")
+    return 0
+
+
+def _cmd_routine_delete(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        ok = kb.delete_routine(conn, args.routine_id)
+    if not ok:
+        print(f"kanban routine delete: {args.routine_id} not found", file=sys.stderr)
+        return 1
+    print(f"Routine {args.routine_id} deleted.")
+    return 0
+
 
 _SLASH_KANBAN_HELP = """\
 **/kanban** — manage the shared task board.
