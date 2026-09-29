@@ -77,3 +77,27 @@ def test_exhausted_free_pool_is_probed_once_per_cooldown_not_once_per_task(tmp_p
     # recovery probe follows the 60s hint, and each failed probe floors the hold at cooldown
     # (1500s = 5 ticks): 4 spawns in the hour instead of one per task per cooldown window.
     assert per_tick == [1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], f"doomed spawns per tick: {per_tick}"
+
+
+def test_malformed_quota_block_holds_only_its_own_profile(tmp_path, monkeypatch):
+    from pathlib import Path
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    atomic_config_write(home / "config.yaml", {})
+    good = {"enabled": True, "state_file": str(tmp_path / "q.json"), "default_domain": "free-pool"}
+    bad = dict(good, state_file="relative/q.json")  # policy_for raises ValueError
+    for name, block in (("good", good), ("bad", bad)):
+        (home / "profiles" / name).mkdir(parents=True)
+        atomic_config_write(home / "profiles" / name / "config.yaml",
+                            {"model": {"provider": "x", "default": "x"}, "quota_admission": block})
+    spawned = []
+    kb.init_db()
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="good", assignee="good")
+        kb.create_task(conn, title="bad", assignee="bad")
+        res = kbd.dispatch_once(conn, spawn_fn=lambda t, w, board=None: spawned.append(t.assignee) or FAKE_PID,
+                                reconcile_orphans=False)
+    assert spawned == ["good"]
+    assert [r for _t, r in res.respawn_guarded] == ["quota_admission_config_invalid"]

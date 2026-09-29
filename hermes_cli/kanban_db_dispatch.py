@@ -2024,7 +2024,7 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
 
 
 def _quota_admission_for_task(conn, task_id: str, assignee: str, *, reserve: bool):
-    from hermes_cli.quota_admission import admit, policy_for
+    from hermes_cli.quota_admission import Admission, admit, policy_for
     from hermes_cli.profiles import resolve_profile_env
     try:
         quota_home = resolve_profile_env(assignee)
@@ -2032,7 +2032,13 @@ def _quota_admission_for_task(conn, task_id: str, assignee: str, *, reserve: boo
         quota_home = None
     with _worker_profile_scope(quota_home) if quota_home else contextlib.nullcontext():
         task = _kb.get_task(conn, task_id)
-        return admit(policy_for(provider=task.provider_override), reserve=reserve)
+        try:
+            policy = policy_for(provider=task.provider_override)
+        except (ValueError, TypeError) as exc:
+            # One profile's malformed block holds only its own tasks, never the whole tick.
+            _kb._log.warning("quota_admission config invalid for %s: %s", assignee, exc)
+            return Admission(False, reason="quota_admission_config_invalid")
+        return admit(policy, reserve=reserve)
 
 
 def _dispatch_lane_task(
