@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -2022,6 +2023,18 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _quota_admission_for_task(conn, task_id: str, assignee: str, *, reserve: bool):
+    from hermes_cli.quota_admission import admit, policy_for
+    from hermes_cli.profiles import resolve_profile_env
+    try:
+        quota_home = resolve_profile_env(assignee)
+    except FileNotFoundError:
+        quota_home = None
+    with _worker_profile_scope(quota_home) if quota_home else contextlib.nullcontext():
+        task = _kb.get_task(conn, task_id)
+        return admit(policy_for(provider=task.provider_override), reserve=reserve)
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2091,6 +2104,12 @@ def _dispatch_lane_task(
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
+    from hermes_cli.quota_admission import settle
+    admission = _quota_admission_for_task(conn, task_id, assignee, reserve=not dry_run)
+    if not admission.allowed:
+        result.respawn_guarded.append((task_id, admission.reason))
+        return False
+
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
@@ -2098,7 +2117,9 @@ def _dispatch_lane_task(
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
+        settle(admission.receipt)
         return False
+    claimed._quota_admission_receipt = admission.receipt
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2106,6 +2127,7 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        settle(admission.receipt)
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2133,6 +2155,7 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        settle(admission.receipt)
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope): nothing about the
@@ -2302,7 +2325,8 @@ def _any_spawnable_review(
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
+        if (check_respawn_guard(conn, row["id"], lane="review") is None
+                and _quota_admission_for_task(conn, row["id"], assignee, reserve=False).allowed):
             return True
     return False
 
@@ -2885,6 +2909,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         strip_launch_profile_env(env, profile_home)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    from hermes_cli.quota_admission import WORKER_RECEIPT_ENV
+    env.pop(WORKER_RECEIPT_ENV, None)
+    if getattr(task, "_quota_admission_receipt", None):
+        env[WORKER_RECEIPT_ENV] = json.dumps(task._quota_admission_receipt)
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by

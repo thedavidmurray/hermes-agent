@@ -2492,8 +2492,14 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    from cron.quota_hold import admit_job
+    admission = admit_job(job)
+    if not admission.allowed:
+        return False, "", "", f"[{admission.reason}] deferred until {admission.retry_at}"
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
+        from hermes_cli.quota_admission import settle
+        settle(job.pop("_quota_admission_receipt", None))
         return early
     from run_agent import AIAgent
 
@@ -2531,6 +2537,8 @@ def run_job(
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
+        from hermes_cli.quota_admission import settle
+        settle(job.pop("_quota_admission_receipt", None), result=result)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
@@ -2545,6 +2553,8 @@ def run_job(
         return True, output, final_response, None
 
     except Exception as e:
+        from hermes_cli.quota_admission import settle
+        settle(job.pop("_quota_admission_receipt", None), error=e)
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
@@ -2573,6 +2583,8 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        from hermes_cli.quota_admission import settle
+        settle(job.pop("_quota_admission_receipt", None))
         from cron.scheduler_detached_worker import defer_teardown_to_running_worker
         _worker_teardown_deferred = defer_teardown_to_running_worker(
             _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
@@ -2725,6 +2737,12 @@ def run_one_job(
 
     execution_id = str(job["execution_id"])
     note_cron_execution(job)
+    from cron.quota_hold import admit_job, defer_admission
+    admission = admit_job(job, reserve=False)
+    if not admission.allowed:
+        defer_admission(job, admission)
+        finish_execution(execution_id, success=False, error=admission.reason)
+        return True
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
@@ -3175,6 +3193,12 @@ def _run_one_job_body(
 
     _scope_token = None
     _terminal_scope_token = None
+    from cron.quota_hold import admit_job, defer_admission
+    admission = admit_job(job)
+    if not admission.allowed:
+        defer_admission(job, admission)
+        finish_execution(execution_id, success=False, error=admission.reason)
+        return True
     try:
         # Commit a finite one-shot's dispatch BEFORE its side effect so a tick dying mid-run cannot
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
@@ -3370,6 +3394,8 @@ def _run_one_job_body(
             raise
         return False
     finally:
+        from hermes_cli.quota_admission import settle
+        settle(job.pop("_quota_admission_receipt", None))
         # Function-level on purpose: must scope delivery, deferred teardown, claim-loss handling and
         # bookkeeping — not just run_job. Do not move into the run block's finally.
         if _scope_token is not None:

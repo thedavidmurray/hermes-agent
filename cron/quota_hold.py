@@ -16,6 +16,7 @@ closed provider window. Any run that reaches the model clears the marker.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -51,7 +52,11 @@ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
             if hint is None:
                 m = _RETRY_AFTER_RE.search(str(cur))
                 hint = float(m.group(1)) if m else None
-            return float(hint) if hint is not None and float(hint) > 0 else None
+            try:
+                seconds = float(hint) if hint is not None else 0.0
+            except (TypeError, ValueError):
+                return None
+            return seconds if math.isfinite(seconds) and seconds > 0 else None
         cur = cur.__cause__ or cur.__context__
     return None
 
@@ -161,3 +166,42 @@ def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
         f"through {safe_strftime(window_end, '%Y-%m-%d %H:%M %Z')} and resumes at the first safe "
         "opportunity afterwards; no further alerts are sent while the provider is unavailable."
     )
+
+
+def admit_job(job: dict, *, reserve: bool = True):
+    """Reserve once, before any cron script, preflight, or model work."""
+    from hermes_cli.quota_admission import Admission, admit, policy_for
+    if "_quota_admission_receipt" in job:
+        return Admission(True, receipt=job["_quota_admission_receipt"])
+    admission = admit(None if job.get("no_agent") else policy_for(provider=job.get("provider")),
+                      reserve=reserve)
+    if admission.allowed and reserve:
+        job["_quota_admission_receipt"] = admission.receipt
+    return admission
+
+
+def defer_admission(job: dict, admission) -> bool:
+    """Park a denied occurrence without spending its repeat/failure budget or sending an alert.
+
+    The native jobs lock and fire-owner check keep a stale worker from clearing a newer claim.
+    One-shots survive the provider outage and run after the hold instead of expiring as missed.
+    """
+    from datetime import timezone
+    from cron.jobs import _with_job, compute_next_run, save_jobs
+
+    def apply(jobs, _index, current):
+        expected = (job.get("fire_claim") or {}).get("by")
+        actual = (current.get("fire_claim") or {}).get("by")
+        if actual != expected:
+            return False
+        if current.get("state") in {"paused", "completed"}:
+            return False
+        until = datetime.fromtimestamp(admission.retry_at, timezone.utc).isoformat()
+        if (current.get("schedule") or {}).get("kind") == "cron":
+            until = compute_next_run(current["schedule"], until) or until
+        current.update(next_run_at=until, quota_hold_until=until, fire_claim=None, run_claim=None)
+        current.pop("pending_slot", None)
+        save_jobs(jobs)
+        return True
+
+    return _with_job(job["id"], apply, missing=False)

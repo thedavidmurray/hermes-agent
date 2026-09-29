@@ -239,6 +239,7 @@ class CLIAgentSetupMixin:
         _model_at_entry = self.model
         self._credentials_rate_limited = False
         self._credentials_terminal = False
+        self._credentials_error = None
         try:
             # target_model: the ladder's model-keyed rungs (Zen/Go api_mode, Copilot/Nous
             # api_mode) must see the model this CLI will actually send, not config's `default`,
@@ -255,6 +256,7 @@ class CLIAgentSetupMixin:
                 _primary_exc = None
         if runtime is None:
             from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+            self._credentials_error = _primary_exc
             self._credentials_rate_limited = bool(_primary_exc) and is_rate_limited_auth_error(_primary_exc)
             # Only an explicit re-authentication requirement is terminal. Unknown
             # resolver/network failures must not acquire the sticky Kanban block.

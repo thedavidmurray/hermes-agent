@@ -290,6 +290,8 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
+    from hermes_cli.quota_admission import finish_worker
+    finish_worker(cli, result)
     _exit_code = _single_query_exit_code(result)
     if emitter is not None:
         _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
@@ -470,7 +472,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             # No exit trailer: the task log now belongs to the run that replaced this one.
             print(t("cli.single_query.kanban_run_reclaimed"), file=sys.stderr)
             sys.exit(0)
+    from hermes_cli.quota_admission import take_worker_receipt, finish_worker
+    cli._quota_admission_receipt = take_worker_receipt()
     if not cli._claim_active_session("cli", stderr=bool(quiet)):
+        finish_worker(cli)
         exit_single_query(1)
     try:
         query, single_query_images = _collect_query_images(query, image)
@@ -527,9 +532,11 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
+        finish_worker(cli, cli._last_turn_result)
         exit_single_query(_single_query_exit_code(
             cli._last_turn_result,
             credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),
             credentials_terminal=getattr(cli, "_credentials_terminal", False)))
     finally:
+        finish_worker(cli)
         _finalize_single_query(cli)
