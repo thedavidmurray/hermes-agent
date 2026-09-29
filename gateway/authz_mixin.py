@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from gateway import bot_traffic_ceiling
 from gateway.bot_loop_guard import BotLoopGuard
 from gateway.config import Platform
 from gateway.pairing import _PLATFORM_ALLOWLIST_ENV
@@ -597,11 +598,28 @@ class GatewayAuthorizationMixin:
         platform = source.platform.value if source.platform else ""
         return (self._adapter_profile_for_source(source) or "", platform, str(source.chat_id or ""))
 
+    def _bot_traffic_ceiling_instance(self) -> "bot_traffic_ceiling.BotTrafficCeiling":
+        ceiling = getattr(self, "_bot_traffic_ceiling", None)
+        if ceiling is None:
+            ceiling = self._bot_traffic_ceiling = bot_traffic_ceiling.BotTrafficCeiling()  # stateless: a race is harmless
+        return ceiling
+
+    def _bot_estop_blocks(self, source: SessionSource) -> bool:
+        """True (and logged once per engagement) when BOT_ESTOP is engaged for this bot-authored message."""
+        if not bot_traffic_ceiling.is_engaged():
+            bot_traffic_ceiling.rearm_drop_notice()
+            return False
+        bot_traffic_ceiling.note_drop(source)
+        return True
+
     def _admit_bot_message(self, source: SessionSource) -> bool:
-        """Count one authorized bot-authored inbound message. False when it trips the budget or the chat is cooling down.
+        """Count one authorized bot-authored inbound message. False under BOT_ESTOP, when it trips the per-process
+        budget, while the chat is cooling down, or when it crosses the fleet ceiling (which latches BOT_ESTOP).
         The inbound handler calls this once per message; ``_is_user_authorized`` only peeks because it is asked several times."""
         if not getattr(source, "is_bot", False):
             return True
+        if self._bot_estop_blocks(source):
+            return False
         allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source))
         if state == "tripped":
             logger.warning(
@@ -609,6 +627,11 @@ class GatewayAuthorizationMixin:
                 "for the window, cooling down (gateway.bot_loop_guard in config.yaml).",
                 source.platform.value if source.platform else "", source.chat_id, source.user_id,
             )
+        if not allowed:
+            return False
+        profile, platform, chat_id = self._bot_loop_guard_conversation(source)
+        allowed, _state = self._bot_traffic_ceiling_instance().admit(
+            platform, chat_id, getattr(source, "message_id", None), profile)
         return allowed
 
     def _is_user_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
@@ -617,12 +640,14 @@ class GatewayAuthorizationMixin:
         Order: trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``,
         per-platform allow-all, adapter role auth, pairing store, env/config allowlists,
         ``GATEWAY_ALLOW_ALL_USERS``, default deny. A bot-authored message that any of these admits
-        is still refused while its chat's loop guard is cooling down.
+        is still refused while BOT_ESTOP is engaged or its chat's loop guard is cooling down.
         """
         if not self._principal_authorized(source, allow_adapter_delegation=allow_adapter_delegation):
             return False
         if not getattr(source, "is_bot", False):
             return True
+        if self._bot_estop_blocks(source):
+            return False
         # The guard judges the final verdict: a chat allowlist admits a bot before the ALLOW_BOTS block runs.
         return not self._bot_loop_guard_instance().blocked(self._bot_loop_guard_conversation(source))
 

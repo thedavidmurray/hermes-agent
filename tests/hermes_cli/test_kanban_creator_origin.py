@@ -31,7 +31,9 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
             tid = json.loads(capsys.readouterr().out)["id"]
         assert kb.get_task(conn, tid).session_id == "durable"
         subs = kn.list_notify_subs(conn, tid)
-        assert len(subs) == 1 and subs[0]["delivery_mode"] == "wake"
+        # The route is inherited, the wake is not: N children must not wake the owner's model N times.
+        assert len(subs) == 1 and subs[0]["delivery_mode"] == "notify"
+        assert kn.list_notify_subs(conn, owner)[0]["delivery_mode"] == "wake"
         assert not conn.execute("SELECT 1 FROM task_links WHERE child_id = ?", (tid,)).fetchone()
         # No ambient identity guessing in the storage API.
         plain = kb.create_task(conn, title="plain", session_id="explicit")

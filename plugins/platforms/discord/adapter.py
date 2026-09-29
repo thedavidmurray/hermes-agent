@@ -298,6 +298,7 @@ try:
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
+from gateway import bot_traffic_ceiling as _bot_traffic_ceiling
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
@@ -1495,7 +1496,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if getattr(message.author, "bot", False):
             allow_bots = self._get_allow_bots()
             bot_tag_continuation = self._is_bot_tag_debounce_continuation(message)
-            if allow_bots == "none":
+            if allow_bots == "none" or _bot_traffic_ceiling.is_engaged():  # BOT_ESTOP: file stat, no model
                 return False, False
             if (
                 allow_bots == "mentions"
@@ -4377,10 +4378,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
     def format_message(self, content: str) -> str:
-        """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables)."""
+        """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables).
+        While BOT_ESTOP is engaged, ``<@id>`` tokens for bots (or unknown users) become plain text so no
+        send, edit or forum post can wake another bot; human pings are kept."""
         if not content:
             return content
+        if _bot_traffic_ceiling.is_engaged():
+            content = re.sub(r"<@!?(\d+)>", self._neutralize_bot_mention, content)
         return convert_table_to_bullets(content)
+
+    def _neutralize_bot_mention(self, match: "re.Match") -> str:
+        get_user = getattr(self._client, "get_user", None)
+        user = None
+        with suppress(Exception):
+            user = get_user(int(match.group(1))) if get_user else None
+        if user is not None and getattr(user, "bot", True) is False:
+            return match.group(0)
+        return f"@{getattr(user, 'name', None) or match.group(1)}"
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired

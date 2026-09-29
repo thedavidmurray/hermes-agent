@@ -33,12 +33,13 @@ def sentinel_path() -> Path:
     return _hermes_home() / SENTINEL_NAME
 
 
-def _candidate_sentinel_paths() -> list:
+def _candidate_sentinel_paths(name: str = SENTINEL_NAME) -> list:
     """Profile home first, then the fleet root if it is a different directory: a profile
-    gateway (HERMES_HOME=~/.hermes/profiles/<n>) must still honor an operator's ~/.hermes/ESTOP."""
-    primary = sentinel_path()
+    gateway (HERMES_HOME=~/.hermes/profiles/<n>) must still honor an operator's ~/.hermes/ESTOP.
+    ``name`` selects another sentinel with the same lookup (``BOT_ESTOP``, gateway/bot_traffic_ceiling.py)."""
+    primary = sentinel_path() if name == SENTINEL_NAME else _hermes_home() / name
     try:
-        root = _canonical_root() / SENTINEL_NAME
+        root = _canonical_root() / name
     except Exception:
         return [primary]
     try:
@@ -49,10 +50,10 @@ def _candidate_sentinel_paths() -> list:
     return [primary, root] if distinct else [primary]
 
 
-def is_engaged() -> bool:
+def is_engaged(name: str = SENTINEL_NAME) -> bool:
     """True if ANY candidate sentinel exists; fail SAFE (True) on stat errors."""
     saw_stat_error = False
-    for path in _candidate_sentinel_paths():
+    for path in _candidate_sentinel_paths(name):
         try:
             if path.exists():
                 return True

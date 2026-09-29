@@ -1472,6 +1472,9 @@ def _inherit_notify_subs(
 
     Omitting columns here silently degrades routing: a DM-originated child completion falls back to
     chat_type='group' and wakes a fresh group-scoped session instead of the originating DM (issue #73030).
+
+    ``delivery_mode`` is the one column NOT copied: children always get post-only ``notify``. A wake
+    subscription on a parent that decomposes into N children would otherwise wake the model N times.
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
@@ -1489,7 +1492,7 @@ def _inherit_notify_subs(
              created_at, last_event_id)
         SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
                COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+               'notify', delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,

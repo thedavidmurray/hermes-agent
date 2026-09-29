@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings, load_settings, settings_from_config
+from gateway.bot_traffic_ceiling import BotTrafficCeiling, CeilingSettings
 from gateway.session import Platform, SessionSource
 
 GROUP_CHAT = "-1001234567890"
@@ -46,6 +47,8 @@ def runner(clock, settings):
     runner = object.__new__(GatewayRunner)
     runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
     runner._bot_loop_guard = BotLoopGuard(settings=lambda: settings["value"], clock=clock.now)
+    # This file tests the per-process guard; the fleet ceiling has its own tests (test_bot_traffic_ceiling.py).
+    runner._bot_traffic_ceiling = BotTrafficCeiling(settings=lambda: CeilingSettings(enabled=False))
     return runner
 
 

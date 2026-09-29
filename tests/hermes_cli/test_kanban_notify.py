@@ -1009,7 +1009,7 @@ def _assert_full_inherited_sub(subs):
         "chat_type dropped during inheritance — wake would key to a "
         "group-scoped session instead of the originating DM (issue #73030)"
     )
-    assert s["delivery_mode"] == "notify+wake"
+    assert s["delivery_mode"] == "notify", "inherited subs must never carry wake"
     md = s["delivery_metadata"]
     assert md and md.get("reply_fallback") == "general", (
         "delivery_metadata dropped during inheritance (issue #73030)"
@@ -1032,6 +1032,32 @@ def test_link_tasks_inherits_all_routing_columns(kanban_home):
     finally:
         conn.close()
     _assert_full_inherited_sub(subs)
+
+
+@pytest.mark.parametrize("mode", ["wake", "notify+wake", "notify"])
+def test_decomposed_children_never_inherit_wake(kanban_home, mode):
+    """A wake subscription on a parent stays on the parent; each of N children gets post-only notify,
+    so one human request cannot fan out into N model wake-ups."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="root", assignee=None)
+        kbn.add_notify_sub(conn, task_id=parent, platform="discord", chat_id="ingest",
+                           notifier_profile="hive", delivery_mode=mode)
+        children = [kb.create_task(conn, title=f"child {i}", assignee="w1", parents=[parent]) for i in range(6)]
+        late = kb.create_task(conn, title="linked later", assignee="w1")
+        kb.link_tasks(conn, parent, late)
+        grandchild = kb.create_task(conn, title="grandchild", assignee="w1", parents=[children[0]])
+        parent_mode = kbn.list_notify_subs(conn, parent)[0]["delivery_mode"]
+        modes = [s["delivery_mode"] for t in (*children, late, grandchild) for s in kbn.list_notify_subs(conn, t)]
+    finally:
+        conn.close()
+    assert parent_mode == mode
+    assert modes == ["notify"] * 8
+
 
 def test_create_with_parents_inherits_delivery_metadata(kanban_home):
     import hermes_cli.kanban_db as kb
