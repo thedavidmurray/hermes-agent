@@ -235,11 +235,17 @@ class _KanbanDispatcher:
                         conn.close()
         return False
 
-    def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
+    def auto_decompose_tick(
+        self, auto_decompose_per_tick: int, max_depth: Optional[int] = None,
+        daily_budget: Optional[int] = None,
+    ) -> int:
         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
 
         Runs before dispatch fans out; the per-tick cap keeps a bulk triage
-        load from burst-spending the aux LLM. Returns the number decomposed.
+        load from burst-spending the aux LLM. ``max_depth`` / ``daily_budget``
+        (``kanban.auto_decompose_max_depth`` / ``_daily_budget``; None = off)
+        leave over-limit tasks in triage without spending a per-tick slot.
+        Returns the number decomposed.
         """
         try:
             from hermes_cli import kanban_decompose as _decomp
@@ -262,6 +268,10 @@ class _KanbanDispatcher:
                     except Exception as exc:
                         logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
                         triage_ids = []
+                    if max_depth is not None or daily_budget is not None:
+                        triage_ids = _decomp.auto_decompose_allowed_ids(
+                            triage_ids, max_depth=max_depth, daily_budget=daily_budget,
+                        )
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break

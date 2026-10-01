@@ -87,6 +87,35 @@ def _resolve_auto_decompose_settings(load_config: Callable[[], Any]) -> "tuple[b
     return bool(kcfg.get("auto_decompose", True)), max(per_tick, 1)
 
 
+def _resolve_auto_decompose_limits(load_config: Callable[[], Any]) -> "tuple[Optional[int], Optional[int]]":
+    """Live ``(max_depth, daily_budget)`` for the auto-decomposer, re-read every tick.
+
+    ``kanban.auto_decompose_max_depth`` / ``kanban.auto_decompose_daily_budget``;
+    each is a non-negative int or None (unset / invalid = no limit, the
+    pre-existing behaviour). Read live for the same reason as
+    ``_resolve_auto_decompose_settings``: these are the brakes on runaway fan-out.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return None, None
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(kcfg, dict):
+        return None, None
+
+    def _limit(key: str) -> Optional[int]:
+        raw = kcfg.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    return _limit("auto_decompose_max_depth"), _limit("auto_decompose_daily_budget")
+
+
 def _gc_retention_days() -> int:
     """``kanban.done_sub_retention_days`` (default 30; 0 disables), re-read per sweep; fails safe to 30."""
     try:

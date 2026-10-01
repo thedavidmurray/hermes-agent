@@ -17,8 +17,11 @@ up with ``assignee=None``.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import sqlite3
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -334,6 +337,103 @@ def decompose_task(
     if not parsed.get("fanout"):
         return _apply_single(task, parsed, routing, audit_author)
     return _apply_fanout(task_id, parsed, routing, audit_author)
+
+
+AUTO_DECOMPOSER_AUTHOR = "auto-decomposer"
+_BUDGET_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def _decompose_depth(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many decompositions sit above ``task_id`` (0 = not a decomposer child).
+
+    Follows the ``from_decompose_of`` lineage stamped on each child's ``created``
+    event. Event GC prunes that event for done/archived tasks, so a chain through
+    a finished ancestor undercounts; the task's own link (the depth-1 check) is
+    always present while it is still in triage.
+    """
+    depth, current, seen = 0, task_id, {task_id}
+    while True:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY id LIMIT 1", (current,),
+        ).fetchone()
+        try:
+            parent = json.loads(row[0] or "{}").get("from_decompose_of") if row else None
+        except (TypeError, ValueError):
+            parent = None
+        if not isinstance(parent, str) or not parent or parent in seen:
+            return depth
+        depth += 1
+        seen.add(parent)
+        current = parent
+
+
+def auto_decompose_skip_reason(
+    conn: sqlite3.Connection, task_id: str, *, max_depth: Optional[int],
+    daily_budget: Optional[int], now: Optional[int] = None,
+) -> str:
+    """Why the AUTOMATIC decomposer must leave this triage task alone; ``""`` = go ahead.
+
+    Gates only the dispatcher tick. ``hermes kanban decompose <id>`` and the
+    dashboard button are a human decision and stay ungated. A skipped task stays
+    in triage: nothing is created, promoted, or spent on the aux LLM.
+
+    ``max_depth``: a task that is itself the product of ``max_depth``
+    decompositions, or that has already been fanned out once, is not fanned out
+    again. That is the path a ``block_loop_detected`` card takes back into
+    triage "for a human" (#28712 follow-up): re-decomposing it undoes the loop
+    breaker. ``daily_budget``: once the auto-decomposer has created this many
+    child tasks on the board in the trailing 24h, it stops until the window frees.
+    """
+    if max_depth is not None:
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
+            (task_id,),
+        ).fetchone():
+            return "already decomposed once"
+        depth = _decompose_depth(conn, task_id)
+        if depth >= max_depth:
+            return f"decompose depth {depth} >= kanban.auto_decompose_max_depth {max_depth}"
+    if daily_budget is not None:
+        since = (int(time.time()) if now is None else int(now)) - _BUDGET_WINDOW_SECONDS
+        created = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_by = ? AND created_at >= ?",
+            (AUTO_DECOMPOSER_AUTHOR, since),
+        ).fetchone()[0]
+        if created >= daily_budget:
+            return f"daily budget spent ({created} >= kanban.auto_decompose_daily_budget {daily_budget})"
+    return ""
+
+
+def auto_decompose_allowed_ids(
+    task_ids: list[str], *, max_depth: Optional[int], daily_budget: Optional[int],
+) -> list[str]:
+    """``task_ids`` minus those the auto-decomposer must skip, on the current board.
+
+    Fails closed: if the board cannot be read, nothing is fanned out this tick.
+    """
+    if max_depth is None and daily_budget is None:
+        return list(task_ids)
+    allowed: list[str] = []
+    try:
+        with kbc.connect_closing() as conn:
+            for tid in task_ids:
+                reason = auto_decompose_skip_reason(
+                    conn, tid, max_depth=max_depth, daily_budget=daily_budget,
+                )
+                if reason:
+                    logger.debug("auto-decompose: leaving %s in triage: %s", tid, reason)
+                else:
+                    allowed.append(tid)
+    except Exception as exc:
+        logger.warning("auto-decompose: limit check failed (%s); skipping this tick", exc)
+        return []
+    if task_ids and not allowed:
+        logger.info(
+            "auto-decompose: %d triage task(s) held by limits (max_depth=%s, daily_budget=%s)",
+            len(task_ids), max_depth, daily_budget,
+        )
+    return allowed
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

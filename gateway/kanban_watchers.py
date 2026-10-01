@@ -19,6 +19,7 @@ from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
     _release_singleton_lock,
+    _resolve_auto_decompose_limits,
     _resolve_auto_decompose_settings,
     _gc_retention_days,
     _to_thread_process_service,
@@ -298,7 +299,10 @@ class GatewayKanbanWatchersMixin:
                     _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
                     # See #49638.
                     if _ad_enabled:
-                        await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                        _ad_depth, _ad_budget = _resolve_auto_decompose_limits(_load_config)
+                        await _to_thread_process_service(
+                            dispatcher.auto_decompose_tick, _ad_per_tick, _ad_depth, _ad_budget,
+                        )
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)

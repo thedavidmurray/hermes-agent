@@ -1948,6 +1948,12 @@ DEFAULT_CONFIG = {
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,
+        # Brakes on the AUTO decomposer only (manual `hermes kanban decompose` is ungated); both
+        # re-read every tick. max_depth: 1 = never fan out a task that came from a decomposition or
+        # was already fanned out once (it stays in triage for a human). daily_budget: max child
+        # tasks the auto-decomposer may create per board in a trailing 24h. None = no limit.
+        "auto_decompose_max_depth": None,
+        "auto_decompose_daily_budget": None,
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
