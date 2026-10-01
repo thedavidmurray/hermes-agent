@@ -275,6 +275,7 @@ KANBAN_GUIDANCE = (
     "1. **Orient.** Call `kanban_show()` first (no args — it defaults to your task). The response includes title, "
     "body, parent-task handoffs (summary + metadata), any prior attempts on this task if you're a retry, the full "
     "comment thread, and a pre-formatted `worker_context` you can treat as ground truth.\n"
+    "   **Search before you act.** Then run `qmd search \"<3-6 keywords from the task>\" -n 5` in the terminal (binary: `/Users/djm/.local/bin/qmd`; a local index of the vault, reports, docs, research notes, agent memory and past Kanban tasks) and open any relevant hit with `qmd get <path>`. Reuse what already exists, and say in your handoff summary what you found or `qmd: nothing relevant`. No terminal tool: skip this.\n"
     "2. **Work inside the workspace.** `cd $HERMES_KANBAN_WORKSPACE` before any file operations. The workspace is "
     "yours for this run. Don't modify files outside it unless the task explicitly asks.\n"
     "3. **Heartbeat on long operations.** Call `kanban_heartbeat(note=...)` every few minutes during long subprocesses "
