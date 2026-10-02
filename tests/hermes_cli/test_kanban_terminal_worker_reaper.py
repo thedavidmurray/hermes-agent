@@ -12,6 +12,7 @@ the next tick — never a recycled PID, never a legacy row without a fingerprint
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -65,7 +66,7 @@ def test_worker_alive_after_completion_is_reaped_on_dispatch_tick(conn):
         run = conn.execute("SELECT worker_pid, worker_started_at, ended_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
         assert run["ended_at"] is not None and run["worker_pid"] == proc.pid and run["worker_started_at"] is not None
 
-        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, dry_run=True, max_spawn=0)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, dry_run=False, max_spawn=0)
 
         assert result.reaped_terminal_workers == [tid]
         assert proc.wait(timeout=10) is not None
@@ -77,6 +78,140 @@ def test_worker_alive_after_completion_is_reaped_on_dispatch_tick(conn):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def test_dry_run_dispatch_skips_signal_but_keeps_db_bookkeeping(conn, monkeypatch):
+    """dry_run=True must NOT send SIGTERM to a live worker (D1 fix).
+
+    A dry-run tick that finds a live host-local worker defers the reap: no
+    termination signal is delivered, the run row KEEPS its pid/fingerprint
+    evidence (clearing it without killing would orphan a live process
+    forever), and nothing is reported as reaped. The next real tick reaps it
+    normally, so the reap is deferred rather than destroyed.
+
+    Signal 0 (liveness probe) is allowed — it does not affect the process.
+    """
+    proc = _sleeper()
+    terminations = []
+    original_kill = os.kill
+
+    def tracking_kill(pid, sig):
+        if sig in (signal.SIGTERM, signal.SIGKILL):
+            terminations.append((pid, sig))
+        original_kill(pid, sig)
+
+    monkeypatch.setattr(os, "kill", tracking_kill)
+    try:
+        tid, run_id = _completed_card_with_worker(conn, proc)
+        run = conn.execute("SELECT worker_pid, worker_started_at, ended_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        assert run["worker_pid"] == proc.pid
+
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, dry_run=True, max_spawn=0)
+
+        # The core assertion: dry_run never terminates a live worker.
+        assert terminations == [], f"dry_run dispatched termination signals: {terminations}"
+        assert proc.poll() is None, "dry_run killed the live worker"
+        assert result.reaped_terminal_workers == []
+        # Evidence retained so a real tick can still reap it.
+        run = conn.execute("SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        assert run["worker_pid"] == proc.pid and run["worker_started_at"] is not None
+
+        # A real tick reaps exactly as before: the fix defers, it does not disable.
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, dry_run=False, max_spawn=0)
+        assert result.reaped_terminal_workers == [tid]
+        assert [pid for pid, _ in terminations] == [proc.pid]
+        assert proc.wait(timeout=10) is not None
+        run = conn.execute("SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        assert run["worker_pid"] is None and run["worker_started_at"] is None
+        kinds = [r["kind"] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert "terminal_worker_reaped" in kinds
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_dry_run_dispatch_never_calls_the_signal_path(conn):
+    """``signal_fn`` is the injectable proof of D1: under ``dry_run`` the
+    reaper's signal path must never be reached at all, so a harness can pass a
+    raising stub and assert safety by construction rather than by discipline."""
+    def explode(pid, sig):
+        raise AssertionError(f"dry_run invoked the signal path: pid={pid} sig={sig}")
+
+    proc = _sleeper()
+    try:
+        tid, run_id = _completed_card_with_worker(conn, proc)
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, dry_run=True, max_spawn=0)
+        run = conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        assert run["worker_pid"] == proc.pid
+        assert proc.poll() is None
+
+        # Direct call: no exception escapes, and the row is left intact.
+        assert kbd.reap_terminal_workers(conn, signal_fn=explode, dry_run=True) == []
+        assert proc.poll() is None
+        run = conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        assert run["worker_pid"] == proc.pid
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_dry_run_does_not_time_out_a_live_worker(conn):
+    """``enforce_max_runtime`` is a second host-signal path reachable from a
+    dry-run tick (it targets *running* workers, not just post-run stragglers).
+    A live over-limit worker must survive a dry-run tick untouched: the
+    ``timed_out`` bookkeeping clears ``worker_pid`` and resets the phase, which
+    only makes sense once the worker is gone."""
+    proc = _sleeper()
+    signals = []
+
+    def signal_fn(pid, sig):
+        signals.append((pid, sig))
+        os.kill(pid, sig)
+
+    try:
+        tid = kb.create_task(conn, title="over limit", assignee="coder")
+        kb.claim_task(conn, tid, claimer=kb._claimer_id())
+        run_id = kb._current_run_id(conn, tid)
+        kbd._set_worker_pid(conn, tid, proc.pid)
+        conn.execute("UPDATE tasks SET max_runtime_seconds=1 WHERE id=?", (tid,))
+        conn.execute("UPDATE task_runs SET started_at = started_at - 600 WHERE id=?", (run_id,))
+
+        assert kbd.enforce_max_runtime(conn, signal_fn=signal_fn, dry_run=True) == []
+        assert signals == [], f"dry_run dispatched termination signals: {signals}"
+        assert proc.poll() is None
+
+        row = conn.execute("SELECT status, worker_pid FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "running", "dry_run reset a live worker's phase"
+        assert row["worker_pid"] == proc.pid
+
+        # The real path still terminates it, so the fix defers rather than disables.
+        assert tid in kbd.enforce_max_runtime(conn, signal_fn=signal_fn)
+        assert proc.wait(timeout=10) is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_dry_run_still_retires_a_worker_that_already_exited(conn):
+    """A worker that is already gone needs no signal, so its bookkeeping still
+    runs under ``dry_run`` — otherwise a dry-run tick could not report what a
+    real tick would reclaim."""
+    tid = kb.create_task(conn, title="dead over limit", assignee="coder")
+    kb.claim_task(conn, tid, claimer=kb._claimer_id())
+    run_id = kb._current_run_id(conn, tid)
+    kbd._set_worker_pid(conn, tid, 999_999)  # no such process
+    conn.execute("UPDATE tasks SET max_runtime_seconds=1 WHERE id=?", (tid,))
+    conn.execute("UPDATE task_runs SET started_at = started_at - 600 WHERE id=?", (run_id,))
+
+    def explode(pid, sig):
+        raise AssertionError(f"dry_run invoked the signal path: pid={pid} sig={sig}")
+
+    assert tid in kbd.enforce_max_runtime(conn, signal_fn=explode, dry_run=True)
+    row = conn.execute("SELECT worker_pid FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["worker_pid"] is None
 
 
 def test_recycled_pid_and_legacy_row_are_never_signalled(conn):

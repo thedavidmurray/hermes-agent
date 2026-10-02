@@ -2417,6 +2417,7 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
 
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
+    dry_run: bool = False,
 ) -> int:
     """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
 
@@ -2468,6 +2469,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            dry_run=dry_run,
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):

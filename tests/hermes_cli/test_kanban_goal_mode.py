@@ -129,6 +129,95 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+# ---------------------------------------------------------------------------
+# Constraint re-assertion (Vibe Physics: a correction accepted on turn 1 must
+# still steer turn 12, after the worker's context has been compacted).
+# ---------------------------------------------------------------------------
+
+
+class TestKanbanGoalConstraintReassert:
+    """The continuation/finalize prompts must re-state the card's acceptance
+    criteria on EVERY turn, not rely on the original task body still being in
+    the worker's (compacting) context."""
+
+    def test_continuation_prompt_restates_criteria(self, monkeypatch):
+        _patch_judge(monkeypatch, ["continue"] * 10)
+        turns = []
+        # Worker finalizes on its third turn so the loop exits without ever
+        # reaching the finalize-nudge path (which has its own coverage below).
+        state = {"n": 0}
+
+        def _run_turn(prompt):
+            turns.append(prompt)
+            state["n"] += 1
+            return "working" if state["n"] < 3 else "finished"
+
+        goals.run_kanban_goal_loop(
+            task_id="t1",
+            goal_text="ACCEPTANCE: never fabricate a source URL.",
+            run_turn=_run_turn,
+            task_status_fn=lambda: "done" if state["n"] >= 3 else "running",
+            block_fn=lambda r: pytest.fail("should not block"),
+            first_response="first turn",
+        )
+        assert len(turns) >= 2, f"expected multiple continuation turns, got {len(turns)}"
+        for p in turns:
+            assert "never fabricate a source URL" in p, (
+                "every continuation turn must re-assert the card's constraints; "
+                f"got: {p[:300]!r}"
+            )
+
+    def test_finalize_prompt_restates_criteria(self, monkeypatch):
+        """The finalize nudge (judge says done, worker has not closed the card)
+        must also re-state the criteria — that is where a drifted worker is most
+        likely to self-certify."""
+        _patch_judge(monkeypatch, ["done", "done"])
+        turns = []
+        goals.run_kanban_goal_loop(
+            task_id="t1",
+            goal_text="ACCEPTANCE: cite every number from a primary source.",
+            run_turn=lambda p: turns.append(p) or "looks done to me",
+            task_status_fn=lambda: "running",
+            block_fn=lambda r: None,  # give up after the second nudge, as designed
+            first_response="first turn",
+        )
+        assert turns, "expected a finalize nudge"
+        assert "cite every number from a primary source" in turns[0]
+
+    def test_reassert_block_is_bounded(self, monkeypatch):
+        _patch_judge(monkeypatch, ["continue"] * 10)
+        turns = []
+        state = {"n": 0}
+        huge = "X" * 50_000 + "\nAcceptance: keep the tests green."
+
+        def _run_turn(prompt):
+            turns.append(prompt)
+            state["n"] += 1
+            return "working" if state["n"] < 2 else "finished"
+
+        goals.run_kanban_goal_loop(
+            task_id="t1",
+            goal_text=huge,
+            run_turn=_run_turn,
+            task_status_fn=lambda: "done" if state["n"] >= 2 else "running",
+            block_fn=lambda r: pytest.fail("should not block"),
+            first_response="first turn",
+        )
+        assert turns
+        # Bounded: the re-assert block must not dwarf the prompt budget.
+        assert len(turns[0]) < 4_000, f"continuation prompt ballooned: {len(turns[0])} chars"
+        assert "truncated" in turns[0]
+
+    def test_empty_goal_text_renders_no_block(self):
+        assert goals._render_goal_reassert("") == ""
+        assert goals._render_goal_reassert("   ") == ""
+
+    def test_short_goal_is_kept_verbatim(self):
+        out = goals._render_goal_reassert("Do the thing, precisely.")
+        assert "Do the thing, precisely." in out
+        assert "truncated" not in out
+
+
 
 
 

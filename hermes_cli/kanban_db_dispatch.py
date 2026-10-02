@@ -447,13 +447,18 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
     started_at=None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
     signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
     UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
     it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
-    spawning a duplicate beside it."""
+    spawning a duplicate beside it.
+
+    ``dry_run=True`` skips all signal delivery — the function returns the would-be termination
+    info with ``dry_run=True`` set, so callers can log what would have happened.
+    """
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
@@ -469,6 +474,15 @@ def _terminate_reclaimed_worker(
 
     kill = _kill_fn(signal_fn)
     if kill is None:
+        return info
+    if dry_run:
+        # Dry-run: deliver no signal. A worker that is already gone (dead, or a
+        # recycled PID we may not signal) still counts as terminated so the caller's
+        # bookkeeping can run; a genuinely live worker stays unterminated, which
+        # makes ``_worker_survived_termination`` hold its claim instead of clearing
+        # the evidence a real tick needs.
+        info["dry_run"] = True
+        info["terminated"] = not _worker_alive(pid, started_at)
         return info
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
@@ -502,7 +516,7 @@ def _terminate_reclaimed_worker(
     return info
 
 
-def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None, dry_run: bool = False) -> list[str]:
     """End host-local workers that outlived their run (issue #111791) — a worker
     that called ``kanban_complete`` and then hung keeps its ``state.db`` sidecar
     fds open and no ``running``-only sweep can see it once ``tasks.worker_pid`` is
@@ -523,7 +537,7 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     reaped: list[str] = []
     for row in rows:
         try:
-            _reap_terminal_worker_row(conn, row, host_prefix, signal_fn, reaped)
+            _reap_terminal_worker_row(conn, row, host_prefix, signal_fn, reaped, dry_run=dry_run)
         except Exception:
             _kb._log.debug(
                 "kanban dispatch: terminal worker reap failed for run %s (task %s)",
@@ -532,7 +546,7 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     return reaped
 
 
-def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
+def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str], dry_run: bool = False) -> None:
     pid, fingerprint = int(row["worker_pid"]), row["worker_started_at"]
     if pid == os.getpid() or not str(row["claim_lock"] or "").startswith(host_prefix):
         return
@@ -542,7 +556,7 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint, dry_run=dry_run)
         if not termination["terminated"]:
             return  # still alive: try again next tick
     with _kb.write_txn(conn):
@@ -565,14 +579,38 @@ def _worker_survived_termination(termination: dict) -> bool:
 
     Reclaiming then would release the claim and spawn a second worker while the
     first still runs — the duplication loop. Only host-local workers we actually
-    signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
-    through to the normal release path since we cannot manage that worker anyway.
+    signalled count, plus workers a dry-run tick *would* have signalled
+    (``dry_run``): suppressing the signal must not release a live worker either.
+    A non-local lock or no-op attempt (no ``os.kill``) must fall through to the
+    normal release path since we cannot manage that worker anyway.
     """
     return bool(
         termination.get("host_local")
-        and (termination.get("termination_attempted") or termination.get("signal_refused"))
+        and (
+            termination.get("termination_attempted")
+            or termination.get("signal_refused")
+            or termination.get("dry_run")
+        )
         and not termination.get("terminated")
     )
+
+
+def _dry_run_holds_live_reclaim(claim_lock, pid, started_at) -> bool:
+    """True when a dry-run tick must leave a reclaim row untouched.
+
+    The reclaim paths clear ``worker_pid`` and reset the task phase as part of
+    retiring a worker, which is only correct once that worker is gone — doing it
+    to a live one lets the next tick spawn a duplicate beside it. Under
+    ``dry_run`` no signal is sent, so a live worker (or one whose identity we
+    cannot disprove) holds its row until a real tick reaps it. A dead or
+    recycled PID needs no signal, so its bookkeeping still runs and the dry-run
+    stays informative.
+    """
+    if not pid or int(pid) <= 0:
+        return False
+    if not str(claim_lock or "").startswith(_kb._host_prefix()):
+        return False
+    return _worker_alive(pid, started_at)
 
 
 def _defer_reclaim_for_live_worker(
@@ -646,13 +684,22 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def enforce_max_runtime(
+    conn: sqlite3.Connection, *, signal_fn=None, dry_run: bool = False,
+) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    ``dry_run=True`` sends no signal at all and, for a row whose worker is still
+    live, defers the whole row: the ``timed_out`` bookkeeping below clears
+    ``worker_pid`` and resets the phase, which only makes sense once the worker is
+    gone. Doing that to a live worker would let the next tick spawn a duplicate
+    beside it. Rows whose worker already exited still get their bookkeeping (no
+    signal is needed to retire them), so a dry-run tick stays useful.
     """
     timed_out: list[str] = []
     now = int(time.time())
@@ -688,12 +735,16 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
             continue
+        if dry_run and _dry_run_holds_live_reclaim(row["claim_lock"], pid, started_at):
+            continue  # would-be signal suppressed; bookkeeping deferred to a real tick
         # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
         # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
+        # mismatch) is never signalled: the worker is already gone. A dry-run tick
+        # signals nothing at all — not even a "harmless" dead pid, whose number may
+        # now belong to a stranger since the reclaim started.
         killed = False
         kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
+        if not dry_run and kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
             with contextlib.suppress(ProcessLookupError, OSError):
                 kill(pid, signal.SIGTERM)
             # Short polling wait — no time.sleep on the write txn.
@@ -751,6 +802,7 @@ def detect_stale_running(
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
+    dry_run: bool = False,
 ) -> list[str]:
     """Reclaim ``running`` tasks with no heartbeat progress; returns their ids.
 
@@ -761,6 +813,10 @@ def detect_stale_running(
     ``0`` disables the check; ``signal_fn`` is a test hook. Deliberately NOT
     counted via ``_record_task_failure``: an absent heartbeat is not a worker
     failure, and counting it would let long-running tasks trip the breaker.
+
+    ``dry_run=True`` sends no signal and leaves a still-live worker's row alone
+    (see ``_dry_run_holds_live_reclaim``); a worker that already exited is still
+    retired, since retiring it needs no signal.
     """
     if stale_timeout_seconds <= 0:
         return []
@@ -792,8 +848,12 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        if dry_run and _dry_run_holds_live_reclaim(lock, pid, _kb._row_get(row, "worker_started_at")):
+            continue  # no signal is sent, so the row keeps its evidence for a real tick
+
         termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"),
+            dry_run=dry_run)
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -1971,8 +2031,21 @@ def dispatch_once(
     Wraps :func:`_dispatch_once_locked` in the non-blocking :func:`_dispatch_tick_lock`
     so two dispatchers on one ``kanban.db`` never race a write tick on WAL
     frames. The loser returns an empty ``DispatchResult`` with
-    ``skipped_locked=True`` and writes nothing; the lock is keyed on the
+    ``DispatchResult`` with ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    ``dry_run=True`` is read-only **with respect to host processes**: no SIGTERM or SIGKILL is
+    delivered to any live worker on this host, including the reclaim paths
+    (``reap_terminal_workers``, ``release_stale_claims``, ``detect_stale_running``,
+    ``enforce_max_runtime``). A reclaim row whose worker is still alive is therefore deferred
+    wholesale rather than cleared — see ``_dry_run_holds_live_reclaim`` — so a dry-run tick cannot
+    orphan a live worker by dropping the evidence a real tick needs to reap it. Rows whose worker has
+    already exited still get their DB bookkeeping, which needs no signal.
+
+    It is **not** read-only with respect to the *database*: the tick still writes reclaim/reconcile/
+    bookkeeping rows (events, run closure, status resets). Against a fixture copy this is invisible,
+    but a harness that hashes a table to assert "nothing changed" must use row-content hashes, not
+    row counts — an UPDATE leaves the count identical.
     """
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -2217,20 +2290,21 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    dry_run: bool = False,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
-    result.reaped_terminal_workers = reap_terminal_workers(conn)
-    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+    result.reaped_terminal_workers = reap_terminal_workers(conn, dry_run=dry_run)
+    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit, dry_run=dry_run)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
-    result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
+    result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds, dry_run=dry_run)
     result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, dry_run=dry_run)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2379,6 +2453,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        dry_run=dry_run,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
