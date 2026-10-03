@@ -147,3 +147,10 @@ def test_relative_or_missing_workspace_still_pins_the_rest(monkeypatch, tmp_path
 
     assert "relative/ws" not in roots
     assert roots and roots[0] == str(kb.task_attachments_dir("t_roots"))
+
+
+def test_guidance_tells_workers_not_to_route_around_the_pin():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "HERMES_WRITE_SAFE_ROOT" in KANBAN_GUIDANCE
+    assert "--workspace dir:<path>" in KANBAN_GUIDANCE
