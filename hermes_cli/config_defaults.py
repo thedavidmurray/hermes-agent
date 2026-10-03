@@ -1954,10 +1954,11 @@ DEFAULT_CONFIG = {
         # tasks the auto-decomposer may create per board in a trailing 24h. None = no limit.
         "auto_decompose_max_depth": None,
         "auto_decompose_daily_budget": None,
-        # Workers get HERMES_WRITE_SAFE_ROOT = task workspace + attachments dir + Hermes root +
+        # Workers get HERMES_WRITE_SAFE_ROOT = task workspace + attachments dir + profile scratch dir +
         # worker_write_roots, so write_file/patch cannot land outside the task's own ground
-        # (hermes_cli/kanban_worker_write_roots.py). worker_write_roots: extra dirs every worker may
-        # write (a knowledge vault, a runtime-state dir). False = no pin; an operator-set
+        # (hermes_cli/kanban_worker_write_roots.py). Never the Hermes root: it holds installed source,
+        # configs and board DBs; a root containing it is dropped. worker_write_roots: extra dirs every
+        # worker may write (a knowledge vault, a runtime-state dir). False = no pin; an operator-set
         # HERMES_WRITE_SAFE_ROOT in the dispatcher's environment is always left as is.
         "worker_write_sandbox": True,
         "worker_write_roots": [],
