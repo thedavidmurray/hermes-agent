@@ -149,6 +149,11 @@ class DispatchResult:
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
+    preflight_warnings: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, warning)`` pairs from the mined failure corpus
+    (:mod:`hermes_cli.kanban_preflight`) — "this profile+task-shape already
+    died N times, class X". Advisory only: nothing is blocked, the warning is
+    logged and attached to the result so telemetry/CLI can surface it."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
@@ -174,6 +179,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.preflight_warnings:
+            counts["preflight_warned"] = counts.get("preflight_warned", 0) + len(res.preflight_warnings)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -2189,6 +2196,25 @@ def _dispatch_lane_task(
         result.respawn_guarded.append((task_id, admission.reason))
         return False
 
+    # Pre-flight failure experience (advisory). The mined corpus says this
+    # profile+task-shape has already died N times in this class — worth a log
+    # line and an event on the card so `tail` explains a repeat failure, but it
+    # never blocks: a warning the dispatcher acts on by refusing work is a
+    # worse failure than the one it predicts.
+    try:
+        from hermes_cli import kanban_preflight as _preflight
+
+        for warning in _preflight.warnings_for(
+            _kb.board_dir(board), assignee, str(row["title"] or "")
+        ):
+            result.preflight_warnings.append((task_id, warning))
+            _kb._log.warning("kanban dispatcher pre-flight: %s — %s", task_id, warning)
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "preflight_warned", {"warning": warning})
+    except Exception as exc:  # experience data must never break a dispatch
+        _kb._log.debug("kanban dispatcher pre-flight unavailable: %s", exc)
+
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
@@ -3012,8 +3038,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # actually happens.
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
-    # Pin write_file/patch to the workspace, attachments dir, Hermes root and
-    # kanban.worker_write_roots (hermes_cli/kanban_worker_write_roots.py).
+    # Pin write_file/patch to the workspace, attachments dir, profile scratch dir and
+    # kanban.worker_write_roots — never the Hermes root (hermes_cli/kanban_worker_write_roots.py).
     from hermes_cli.kanban_worker_write_roots import apply_worker_write_roots
     apply_worker_write_roots(env, task, workspace, board=board)
     if task.branch_name:
