@@ -3012,6 +3012,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # actually happens.
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
+    # Pin write_file/patch to the workspace, attachments dir, Hermes root and
+    # kanban.worker_write_roots (hermes_cli/kanban_worker_write_roots.py).
+    from hermes_cli.kanban_worker_write_roots import apply_worker_write_roots
+    apply_worker_write_roots(env, task, workspace, board=board)
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
