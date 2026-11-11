@@ -1,0 +1,23 @@
+name: thermal-receipts
+repo: https://github.com/thedavidmurray/hermes-receipts
+sha: AF5_PLACEHOLDER
+title: Receipts (thermal evidence receipts)
+description: "Thermal-paper evidence receipts for Hermes turns: what the agent claimed vs. what Hermes observed. Read-only historical state.db backfill plus a profile-local tool metadata ledger; deterministic claim matcher; experimental v2 task receipts (explicit local manifest, local file/bare-git readbacks), kits/themes/58-80mm printer config, optional Desktop pane. Disclosure: reads the selected profile's state.db conversations/tool arguments read-only; stores tool names, args hashes, coarse results and generated images under plugin-data/receipts. No network/model calls, telemetry, credentials or background work. Optional USB printer requires explicit device IDs and separately installed python-escpos; opt-in response stamp and prior-answer completion-block gate are off by default. Implementer-labelled benchmark (README): 200 historical answers, 87.04% precision / 50.00% recall at binary claim detection; evidence-verdict accuracy not measured."
+maintainer: thedavidmurray
+tier: community
+category: desktop
+requires_hermes: ">=0.21.7"
+docs_url: https://github.com/thedavidmurray/hermes-receipts
+version: "0.1.0"
+screenshots:
+  - https://raw.githubusercontent.com/thedavidmurray/hermes-receipts/AF5_PLACEHOLDER/assets/real-receipt.png
+readme: true
+platforms: []
+capabilities:
+  provides_tools: []
+  provides_hooks:
+    - post_tool_call
+    - transform_llm_output
+    - pre_tool_call
+  provides_middleware: []
+  requires_env: []
