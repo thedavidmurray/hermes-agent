@@ -1085,9 +1085,15 @@ def _prepare_runtime_status_update(
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None, keep_platforms: Iterable[str] = (),
+    enabled_platforms: Optional[Iterable[str]] = None,
     load_existing: bool = True, reload_existing: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
-    """Merge one update into the process-wide canonical status snapshot."""
+    """Merge one update into the process-wide canonical status snapshot.
+
+    Startup supplies ``enabled_platforms`` from its resolved config to prune stale
+    primary entries. None leaves them alone; an empty iterable removes them all.
+    Prefixed entries belong to other profiles and use the existing cleanup flags.
+    """
     global _runtime_status_state_path, _runtime_status_state
     path = _get_runtime_status_path()
     with _runtime_status_state_lock:
@@ -1103,6 +1109,12 @@ def _prepare_runtime_status_update(
         payload.setdefault("platforms", {})
         if not isinstance(payload["platforms"], dict):
             payload["platforms"] = {}
+        if enabled_platforms is not None:
+            enabled = set(enabled_platforms)
+            payload["platforms"] = {
+                k: v for k, v in payload["platforms"].items()
+                if k in enabled or (isinstance(k, str) and ":" in k)
+            }
         if clear_profile_platforms or drop_profile_platforms:
             drop_prefix = f"{drop_profile_platforms}:" if drop_profile_platforms else None
             payload["platforms"] = {

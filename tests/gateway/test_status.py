@@ -273,6 +273,83 @@ class TestScopedGatewayPidQuery:
 
 
 class TestGatewayRuntimeStatus:
+    @pytest.mark.parametrize("enabled", [{"telegram"}, set()])
+    def test_boot_prunes_disabled_and_removed_platforms(self, tmp_path, monkeypatch, enabled):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        failing = {
+            "state": "retrying", "error_code": "adapter_unavailable",
+            "needs_attention": True, "retrying_since": "2026-11-09T19:31:06Z",
+        }
+        prior = {"platforms": {
+            "local": dict(failing), "removed": dict(failing),
+            "telegram": dict(failing), "reviewer:discord": dict(failing),
+        }}
+        (tmp_path / "gateway_state.json").write_text(json.dumps(prior))
+
+        _, payload, previous = status._prepare_runtime_status_update(
+            gateway_state="starting", reload_existing=True, enabled_platforms=enabled,
+        )
+
+        assert previous == prior  # Transition evidence must not be mutated.
+        assert payload["platforms"] == {
+            **({"telegram": failing} if "telegram" in enabled else {}),
+            "reviewer:discord": failing,  # Other profiles have their own reconciliation.
+        }
+        _, heartbeat, _ = status._prepare_runtime_status_update(active_agents=0)
+        assert heartbeat["platforms"] == payload["platforms"]
+
+    @pytest.mark.asyncio
+    async def test_startup_passes_resolved_enabled_platforms(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run_startup import GatewayStartupMixin
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        failing = {"state": "retrying", "needs_attention": True}
+        (tmp_path / "gateway_state.json").write_text(json.dumps({"platforms": {
+            name: failing for name in ("local", "discord", "removed", "plugin")
+        }}))
+        runner = Mock()
+        runner.config = SimpleNamespace(sessions_dir=tmp_path / "sessions", platforms={
+            Platform.LOCAL: PlatformConfig(enabled=True),
+            Platform.DISCORD: PlatformConfig(enabled=False),
+            "plugin": PlatformConfig(enabled=True),
+        })
+
+        await GatewayStartupMixin._start_log_startup_environment(runner)
+
+        record = status.read_runtime_status()
+        assert record is not None
+        assert record["platforms"] == {"local": failing, "plugin": failing}
+
+    def test_boot_pruning_preserves_multiplexer_cleanup_and_enabled_retries(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        failing = {"state": "retrying", "needs_attention": True}
+        (tmp_path / "gateway_state.json").write_text(json.dumps({"platforms": {
+            "local": failing, "old:discord": failing, "reviewer:slack": failing,
+        }}))
+        status.write_runtime_status(
+            gateway_state="starting", reload_existing=True,
+            enabled_platforms={"telegram"}, clear_profile_platforms=True,
+            keep_platforms={"reviewer:slack"},
+        )
+        status.publish_runtime_status(
+            platform="telegram", platform_state="retrying", needs_attention=True,
+            error_code="adapter_unavailable", retrying_since="2026-11-09T19:31:06Z",
+        )
+        status.publish_runtime_status(active_agents=0)
+        assert status.flush_runtime_status(timeout=2.0)
+        platforms = status.read_runtime_status()["platforms"]
+        assert set(platforms) == {"telegram", "reviewer:slack"}
+        assert platforms["reviewer:slack"] == failing
+        assert platforms["telegram"]["state"] == "retrying"
+        assert platforms["telegram"]["needs_attention"] is True
+        assert platforms["telegram"]["error_code"] == "adapter_unavailable"
+        assert platforms["telegram"]["retrying_since"] == "2026-11-09T19:31:06Z"
+
     def test_clear_profile_platforms_preserves_primary_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "gateway_state.json").write_text(
