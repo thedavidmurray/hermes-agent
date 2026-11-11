@@ -954,6 +954,10 @@ class GatewayStartupMixin:
                 gateway_state="starting",
                 exit_reason=None,
                 clear_profile_platforms=True,
+                enabled_platforms={
+                    getattr(platform, "value", platform)
+                    for platform, cfg in self.config.platforms.items() if cfg.enabled
+                },
                 reload_existing=True,
                 wait_timeout=2.0,
             )
