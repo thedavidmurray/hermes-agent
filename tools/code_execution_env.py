@@ -309,7 +309,15 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             return session_cwd
     from agent.runtime_cwd import scope_terminal_cwd
     raw = scope_terminal_cwd().strip()
-    for candidate in (os.path.expanduser(raw) if raw else "", os.getcwd()):
-        if candidate and os.path.isdir(candidate):
-            return candidate
+    candidate = os.path.expanduser(raw) if raw else ""
+    if candidate and os.path.isdir(candidate):
+        return candidate
+    # A completed worker's workspace may be removed while its process is still alive.
+    # Resolve this rung lazily so a valid session cwd never depends on process cwd.
+    try:
+        candidate = os.getcwd()
+    except FileNotFoundError:
+        return staging_dir
+    if os.path.isdir(candidate):
+        return candidate
     return staging_dir
