@@ -323,6 +323,49 @@ class TestGatewayRuntimeStatus:
         assert record is not None
         assert record["platforms"] == {"local": failing, "plugin": failing}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("relay_state", ["connected", "retrying", "fatal"])
+    async def test_boot_pruning_preserves_enabled_shared_listener_mirrors(
+        self, tmp_path, monkeypatch, relay_state,
+    ):
+        """Pruning primary keys must not erase the shared ingress served profiles use."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run_startup import GatewayStartupMixin
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        listeners = {
+            "relay": {"state": relay_state, "needs_attention": relay_state != "connected"},
+            "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:45719"},
+            "webhook": {"state": "retrying", "listener_base": "http://127.0.0.1:45720"},
+        }
+        (tmp_path / "gateway_state.json").write_text(json.dumps({"platforms": {
+            **listeners, "discord": {"state": "retrying", "needs_attention": True},
+            "removed": {"state": "retrying", "needs_attention": True},
+            "alpha:telegram": {"state": "connected"},
+        }}))
+        runner = Mock()
+        runner.config = SimpleNamespace(sessions_dir=tmp_path / "sessions", platforms={
+            Platform.RELAY: PlatformConfig(enabled=True),
+            Platform.API_SERVER: PlatformConfig(enabled=True),
+            Platform.WEBHOOK: PlatformConfig(enabled=True),
+            Platform.DISCORD: PlatformConfig(enabled=False, disabled_by_relay=True),
+        })
+
+        await GatewayStartupMixin._start_log_startup_environment(runner)
+
+        record = status.read_runtime_status()
+        assert record is not None
+        assert record["platforms"] == listeners
+        mirrored = status.profile_platforms_from_multiplexer(record, "alpha")
+        assert set(mirrored) == set(listeners)
+        assert mirrored["relay"]["state"] == relay_state
+        assert mirrored["relay"]["needs_attention"] is (relay_state != "connected")
+        assert mirrored["api_server"]["ingress_url"] == "http://127.0.0.1:45719/p/alpha/v1"
+        assert mirrored["webhook"]["ingress_url"] == "http://127.0.0.1:45720/p/alpha/webhooks/<route>"
+        assert all(entry["mirrored_from"] == "default" for entry in mirrored.values())
+
     def test_boot_pruning_preserves_multiplexer_cleanup_and_enabled_retries(
         self, tmp_path, monkeypatch,
     ):
