@@ -74,11 +74,21 @@ def open_profile_store(runner, home):
 
 
 async def _prewarm_profile_stores(runner, homes):
-    """Open every secondary's store concurrently off the loop before the authorities are built in
-    order. A failed open is not reported here: the cache records it and the authority build that
-    follows parks that profile with the recorded reason."""
-    await asyncio.gather(*(asyncio.to_thread(open_profile_store, runner, home) for _name, home in homes),
-                         return_exceptions=True)
+    """Open secondaries off-loop with bounded concurrency before building authorities.
+
+    Every first SessionDB open scans all process descriptors on macOS. Letting all
+    profiles do that together amplifies libproc/GIL contention until otherwise-fast
+    scans exhaust their five-second budget. Limit submissions, not executor threads:
+    unrelated gateway work must retain capacity in the shared default executor.
+    A failed open is still recorded by the cache and reported by the authority build.
+    """
+    slots = asyncio.Semaphore(4)
+
+    async def prewarm(home):
+        async with slots:
+            await asyncio.to_thread(open_profile_store, runner, home)
+
+    await asyncio.gather(*(prewarm(home) for _name, home in homes), return_exceptions=True)
 
 
 def pin_launch_store():
