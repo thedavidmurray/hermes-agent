@@ -305,8 +305,50 @@ def committed_venv(project_root: Path) -> Path | None:
     return _recorded_venv(project_root) or payload_venv(project_root)
 
 
+def _worktree_parent(project_root: Path) -> Path | None:
+    """Resolve a registered linked worktree using Git's on-disk common-dir contract.
+
+    No Git subprocess (or third-party import) may run during early activation.
+    Require the reciprocal registration: a copied .git pointer or submodule is
+    not authority to borrow another checkout's dependencies.
+    """
+    marker = Path(project_root).resolve() / ".git"
+    if not marker.is_file():
+        return None
+    try:
+        prefix, separator, value = marker.read_text(encoding="utf-8").strip().partition(":")
+        if prefix != "gitdir" or not separator or not value.strip():
+            return None
+        gitdir = (marker.parent / value.strip()).resolve()
+        common = (gitdir / (gitdir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+        registered = Path((gitdir / "gitdir").read_text(encoding="utf-8").strip())
+        if (common.name != ".git" or gitdir.parent != common / "worktrees"
+                or registered.resolve() != marker or not (common / "HEAD").is_file()):
+            return None
+        return common.parent
+    except (OSError, ValueError, RuntimeError):
+        return None  # Missing/stale Git metadata is not a dependency fallback.
+
+
+def _boot_facts_path(project_root: Path) -> Path:
+    """Read-only selection fallback; never change install_key or PM's write paths."""
+    own = runtime_facts_path(project_root)
+    # A damaged, empty or dangling own record must retain its existing semantics.
+    if own.exists() or own.is_symlink():
+        return own
+    parent = _worktree_parent(project_root)
+    if parent is not None:
+        local = runtime_facts_path(parent)
+        if local.exists() or local.is_symlink():
+            return local
+        owner = owning_home_root(parent)
+        if owner is not None:
+            return owner / "installs" / install_key(parent) / "facts.json"
+    return own
+
+
 def _recorded_venv(project_root: Path) -> Path | None:
-    path = runtime_facts_path(project_root)
+    path = _boot_facts_path(project_root)
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
@@ -323,7 +365,7 @@ def _recorded_venv(project_root: Path) -> Path | None:
     if not isinstance(value, str):
         raise RuntimeError("invalid dependency environment path")
     environment = Path(value).resolve()
-    generations = install_state_dir(project_root) / "environments"
+    generations = path.parent / "environments"
     if not environment.is_relative_to(generations.resolve()) or not (environment / "pyvenv.cfg").is_file():
         raise RuntimeError(f"dependency environment is missing or outside this install: {environment}")
     return environment
@@ -469,13 +511,17 @@ def activate_dependencies(project_root: Path) -> None:
     """
     import sys
 
-    state = install_state_dir(project_root)
+    facts = _boot_facts_path(project_root)
+    borrowed = facts != runtime_facts_path(project_root)
+    state = facts.parent
     if state.is_dir():
+        from contextlib import nullcontext
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
         # The lock's holder may be another profile's backend running a full dependency rebuild;
         # this process only reads the committed selection, so it proceeds without waiting rather
         # than leaving the backend unbound (see runtime_lock).
-        with runtime_lock(project_root) as held:
+        # A borrower only reads/leases: never recover or publish the owner's state.
+        with (nullcontext(False) if borrowed else runtime_lock(project_root)) as held:
             if held:
                 recover_publication(project_root)
             environment = committed_venv(project_root)
@@ -488,7 +534,7 @@ def activate_dependencies(project_root: Path) -> None:
                 release()
                 environment, release = current, lease_generation(current)
             selected = site_packages(environment)
-            if not selected.is_dir() and not runtime_facts_path(project_root).is_file():
+            if not selected.is_dir() and not facts.is_file():
                 return
     else:
         # Sealed payloads still select once, before imports.
