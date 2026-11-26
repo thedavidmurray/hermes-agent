@@ -900,6 +900,7 @@ def judge_goal(
     background_processes: Optional[list[dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    delegated_gates: str = "",
 ) -> tuple[str, str, bool, Optional[dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -941,6 +942,12 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(subgoals_block=_truncate(subgoals_block, 2000), **common)
     else:
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
+
+    # Graph-owned phase scope is appended AFTER truncating the original goal. Long
+    # release specs must not silently lose their downstream ownership boundary.
+    # Keep the legacy prompt byte-identical when no child gates are waiting.
+    if delegated_gates:
+        prompt += "\n\n" + delegated_gates
 
     try:
         raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)

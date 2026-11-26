@@ -1641,6 +1641,32 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return _linked_ids(conn, "child_id", "parent_id", task_id)
 
 
+def delegated_gate_context(conn: sqlite3.Connection, task_id: str) -> str:
+    """Scope a handoff judge to this phase, not acceptance owned by waiting children.
+
+    No graph mutation or inferred delegation: only direct, not-yet-running children
+    count. Empty means the judge's original input must remain byte-identical.
+    """
+    rows = conn.execute(
+        "SELECT t.id, t.assignee, t.title FROM task_links l "
+        "JOIN tasks t ON t.id = l.child_id WHERE l.parent_id = ? "
+        "AND t.status IN ('todo', 'ready', 'blocked') ORDER BY t.id", (task_id,),
+    ).fetchall()
+    if not rows:
+        return ""
+    children = "\n".join(
+        f"- {row['id']} | assignee: {row['assignee'] or '(unassigned)'} | {row['title']}"
+        for row in rows
+    )
+    return (
+        "DELEGATED GATES — these cards start only after this one completes and own "
+        "their own acceptance:\n" + children + "\n"
+        "Criteria that only those cards can satisfy (review, CI, merge, deploy, live probe) "
+        "are OUT OF SCOPE for this card; judge only the remaining criteria. "
+        "This does not excuse incomplete implementation or missing evidence owned by this card."
+    )
+
+
 def task_graph_contexts(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, dict]:
     """Bulk-load compact direct graph state for graph-aware diagnostics."""
     ordered_ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
