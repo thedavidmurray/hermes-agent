@@ -308,20 +308,16 @@ def arm_shutdown_watchdog(
     snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None, exit_code: int = 1,
     dump_path: Optional[Path] = None, name: str = "gateway-shutdown-watchdog") -> threading.Event:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path: exits quietly if
-    ``done_event`` is set within ``delay_s``, else dumps diagnostics and ``os._exit(exit_code)``.
-    Never raises; returns ``done_event`` for disarming."""
+    ``done_event`` is set within ``delay_s``, else allows at most 0.25s for best-effort
+    diagnostics/cleanup before calling ``os._exit(exit_code)`` directly. Thus the bound
+    is delay_s + 0.25s (subject to OS scheduling and the Python GIL), even if diagnostics
+    block forever. Never raises; returns ``done_event`` for disarming."""
     done = done_event if done_event is not None else threading.Event()
     delay = _coerce_float(delay_s, DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S)
     if delay <= 0:
         return done
 
-    def _watchdog() -> None:
-        deadline = time.monotonic() + delay  # chunked wait so a late disarm is observed within ~1s
-        while time.monotonic() < deadline:
-            if done.wait(timeout=min(deadline - time.monotonic(), 1.0)):
-                return
-        if done.is_set():
-            return
+    def _diagnostics() -> None:
         try:
             snapshot = snapshot_fn() if snapshot_fn is not None else None
         except Exception as exc:
@@ -347,7 +343,31 @@ def arm_shutdown_watchdog(
             from hermes_logging import drain_log_queue
             drain_log_queue(timeout=1.0)
         _mark_exited_quietly(exit_code, "shutdown_watchdog")
-        _hard_exit(exit_code)
+        # _hard_exit also imports and takes the foreground-process registry lock.
+        # Do that best-effort cleanup here, never on the deadline thread.
+        with contextlib.suppress(Exception):
+            from tools.environments.base import kill_live_foreground_processes
+            kill_live_foreground_processes(now=True)
+
+    deadline = time.monotonic() + delay
+
+    def _watchdog() -> None:
+        while time.monotonic() < deadline:
+            if done.wait(timeout=max(0.0, min(deadline - time.monotonic(), 1.0))):
+                return
+        if done.is_set():
+            return
+        # Everything above can block: snapshot counters, imports, file/stderr I/O,
+        # logging/flush, lifecycle/status locks, log drain and subprocess cleanup.
+        # A separate daemon gets at most 250ms total, not 250ms per operation.
+        # The exit thread must invoke os._exit DIRECTLY, not the cleanup wrapper.
+        diagnostic_deadline = time.monotonic() + 0.25
+        try:
+            diagnostic = threading.Thread(target=_diagnostics, daemon=True, name=name + "-diagnostics")
+            diagnostic.start()
+            diagnostic.join(timeout=max(0.0, diagnostic_deadline - time.monotonic()))
+        finally:
+            os._exit(exit_code)
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()
     except Exception:

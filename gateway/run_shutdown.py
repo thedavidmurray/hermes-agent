@@ -2108,7 +2108,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         if not os.environ.get("PYTEST_CURRENT_TEST"):
             arm_shutdown_watchdog(
                 _effective_watchdog_leash(self), done_event=_watchdog_done,
-                snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx), exit_code=1,
+                snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx),
+                exit_code=GATEWAY_SERVICE_RESTART_EXIT_CODE,
             )
         try:
             await GatewayRunner._stop_begin_teardown(self, ctx)
